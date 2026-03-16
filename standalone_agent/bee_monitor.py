@@ -549,6 +549,17 @@ class EventHandler:
             path = self.inbox.write_journal(journal_id, text, state)
             self._print(f"  📥 Journal written to: {path}")
 
+            # --- KEYWORD DETECTION in finalized journal ---
+            if self.command_capture is not None:
+                self.command_capture.add_utterance(text)
+                self._print(f"  🎤 [capturing command from journal] {text[:80]}")
+            else:
+                triggered, remaining = self.trigger.detect(text)
+                if triggered:
+                    self._print(f"  ⚡ TRIGGER DETECTED in journal! Starting command capture...")
+                    self._alert("OpenCLAW Activated", f"Listening for command... ({remaining[:50]})")
+                    self.command_capture = CommandCapture(initial_text=remaining)
+
     def _on_journal_text(self, data: dict):
         text = data.get("text", "")
         journal_id = str(data.get("journalId", "unknown"))
@@ -557,6 +568,17 @@ class EventHandler:
             # Write partial transcription too
             path = self.inbox.write_journal(journal_id, text, "TRANSCRIBING")
             self._print(f"  📥 Journal text written to: {path}")
+
+            # --- KEYWORD DETECTION in journal text ---
+            if self.command_capture is not None:
+                self.command_capture.add_utterance(text)
+                self._print(f"  🎤 [capturing command from journal] {text[:80]}")
+            else:
+                triggered, remaining = self.trigger.detect(text)
+                if triggered:
+                    self._print(f"  ⚡ TRIGGER DETECTED in journal! Starting command capture...")
+                    self._alert("OpenCLAW Activated", f"Listening for command... ({remaining[:50]})")
+                    self.command_capture = CommandCapture(initial_text=remaining)
 
     # --- Location ---
 
