@@ -176,7 +176,15 @@ class LiveStreamCache:
             self._cache_location(raw_json)
 
     def _classify_event(self, data: dict) -> str:
-        """Infer the event type from the JSON payload structure."""
+        """Determine the event type — uses the 'type' field from the stream
+        when present, falls back to payload inference for older formats."""
+        # The real bee stream --json includes a "type" field directly
+        if "type" in data:
+            return data["type"]
+        # Connection event is just {"timestamp": ...}
+        if "timestamp" in data and len(data) == 1:
+            return "connected"
+        # Fallback: infer from payload structure
         if "utterance" in data:
             return "new-utterance"
         if "conversation" in data:
@@ -184,7 +192,6 @@ class LiveStreamCache:
             state = conv.get("state", "")
             if state in ("completed", "ended", "finalized"):
                 return "update-conversation"
-            # Check if this is an update vs new
             conv_id = str(conv.get("id", ""))
             if conv_id in self.active_conversations:
                 return "update-conversation"
@@ -192,10 +199,7 @@ class LiveStreamCache:
         if "short_summary" in data and "conversation_id" in data:
             return "update-conversation-summary"
         if "todo" in data:
-            todo = data["todo"]
-            if todo.get("completed"):
-                return "todo-updated"
-            return "todo-created"
+            return "todo-updated" if data["todo"].get("completed") else "todo-created"
         if "journal" in data:
             return "journal-created"
         if "location" in data:
@@ -207,9 +211,10 @@ class LiveStreamCache:
     def _cache_utterance(self, data: dict, timestamp: str):
         utterance = data.get("utterance", {})
         self.utterances.append({
-            "speaker": utterance.get("speaker", "unknown"),
+            "speaker": utterance.get("speaker", "me"),  # may be absent in solo convos
             "text": utterance.get("text", ""),
             "conversation_uuid": data.get("conversation_uuid", ""),
+            "spoken_at": utterance.get("spoken_at", timestamp),
             "time": timestamp,
         })
         self.stats["utterances"] += 1
@@ -218,9 +223,10 @@ class LiveStreamCache:
         conv = data.get("conversation", {})
         conv_id = str(conv.get("id", ""))
         state = conv.get("state", "unknown")
+        conv_uuid = conv.get("conversation_uuid") or conv.get("uuid", "")
         self.active_conversations[conv_id] = {
             "id": conv.get("id"),
-            "uuid": conv.get("uuid", ""),
+            "uuid": conv_uuid,
             "state": state,
             "title": conv.get("title", ""),
             "short_summary": conv.get("short_summary", ""),

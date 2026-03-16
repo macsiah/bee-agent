@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-Bee Wearable Standalone Monitoring Agent
-========================================
-A standalone agent that monitors the Bee wearable's real-time event stream
-and provides proactive alerts, summaries, and insights.
+Bee Wearable Monitoring Agent
+==============================
+An always-on agent that monitors the Bee wearable's real-time event stream,
+detects voice commands (keyword activation), collates thoughts, and writes
+structured outputs (todos, conversation logs, command queue) for OpenCLAW.
 
-Features:
-  - Real-time SSE event monitoring via `bee stream`
-  - Automatic conversation summaries when conversations end
-  - Todo tracking with alarm notifications
-  - Periodic context digests
-  - Change-feed polling with cursor persistence
-  - Webhook support for forwarding events to external services
+Core behaviors:
+  1. CONVERSATIONS (button push) — Detected, tracked, and summarized when they end.
+     Full transcript written to the inbox for OpenCLAW processing.
+  2. JOURNALS/NOTES (button hold) — Detected immediately. Transcribed text written
+     to the inbox as a thought/note for collation.
+  3. KEYWORD ACTIVATION — When the owner says "OpenCLAW" (or configured trigger),
+     the following utterances are captured as a voice command and written to the
+     command queue for OpenCLAW to execute.
+  4. AMBIENT INTELLIGENCE — All utterances are monitored. Periodically, the agent
+     writes a collated thought digest and auto-generated todo list.
+
+Architecture:
+  bee stream --json → this agent → writes files to ~/.bee-agent/inbox/
+  OpenCLAW scheduled task → reads inbox → processes commands, collates thoughts
 
 Usage:
-    python bee_monitor.py                          # Start monitoring
-    python bee_monitor.py --mode stream            # SSE stream mode
-    python bee_monitor.py --mode poll --interval 60  # Polling mode (every 60s)
-    python bee_monitor.py --mode digest            # One-shot digest
-    python bee_monitor.py --webhook-url https://...  # Forward events via webhook
+    python bee_monitor.py                    # Start with defaults
+    python bee_monitor.py --trigger openclaw # Custom trigger word
+    python bee_monitor.py --mode digest      # One-shot summary
+    python bee_monitor.py --inbox ~/my-inbox # Custom inbox directory
 
 Requirements:
     - bee-cli installed and authenticated
@@ -29,10 +36,12 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
@@ -42,22 +51,39 @@ from typing import Optional, Callable
 # Configuration
 # ---------------------------------------------------------------------------
 
-CURSOR_FILE = Path.home() / ".bee-agent-cursor"
-LOG_FILE = Path.home() / ".bee-agent-log.jsonl"
-USER_PROFILE_FILE = Path.home() / ".bee-user-profile.md"
+DEFAULT_INBOX_DIR = Path.home() / ".bee-agent" / "inbox"
+COMMANDS_DIR_NAME = "commands"
+CONVERSATIONS_DIR_NAME = "conversations"
+JOURNALS_DIR_NAME = "journals"
+THOUGHTS_DIR_NAME = "thoughts"
+
+CURSOR_FILE = Path.home() / ".bee-agent" / "cursor"
+LOG_FILE = Path.home() / ".bee-agent" / "event-log.jsonl"
+STATE_FILE = Path.home() / ".bee-agent" / "state.json"
+
+# How many seconds of utterances to capture after the trigger keyword
+COMMAND_CAPTURE_WINDOW_SEC = 15
+# How many seconds of silence (no utterances) ends a command capture
+COMMAND_SILENCE_TIMEOUT_SEC = 5
+# Minimum collation interval (don't collate more often than this)
+COLLATION_INTERVAL_SEC = 300  # 5 minutes
+
+# Default trigger keywords (case-insensitive, fuzzy matched)
+DEFAULT_TRIGGERS = ["openclaw", "open claw", "hey openclaw", "hey open claw"]
 
 
 def find_bee_cli() -> str:
     """Locate the bee CLI binary."""
-    for candidate in ["bee", os.path.expanduser("~/.bun/bin/bee"), "/usr/local/bin/bee"]:
+    for candidate in ["bee", os.path.expanduser("~/.bun/bin/bee"), "/usr/local/bin/bee",
+                       os.path.expanduser("~/.nvm/versions/node/*/bin/bee"), "/opt/homebrew/bin/bee"]:
         try:
             result = subprocess.run(
                 [candidate, "--version"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
             )
             if result.returncode == 0:
                 return candidate
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
     return "bee"
 
@@ -66,7 +92,7 @@ BEE_CLI = find_bee_cli()
 
 
 # ---------------------------------------------------------------------------
-# Bee CLI Wrapper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def run_bee(args: list[str], timeout: int = 30) -> str:
@@ -98,9 +124,34 @@ def run_bee_json(args: list[str], timeout: int = 30) -> dict | list | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Cursor Persistence
-# ---------------------------------------------------------------------------
+def ts() -> str:
+    """Current timestamp for display."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def ts_iso() -> str:
+    """Current UTC ISO timestamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ts_file() -> str:
+    """Timestamp safe for filenames."""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def ensure_dirs(inbox: Path):
+    """Create the inbox directory structure."""
+    for subdir in [COMMANDS_DIR_NAME, CONVERSATIONS_DIR_NAME, JOURNALS_DIR_NAME, THOUGHTS_DIR_NAME]:
+        (inbox / subdir).mkdir(parents=True, exist_ok=True)
+
+
+def log_event(event_type: str, data: dict):
+    """Append an event to the JSONL log file."""
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"timestamp": ts_iso(), "event": event_type, "data": data}
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 
 def load_cursor() -> Optional[str]:
     """Load the last saved cursor from disk."""
@@ -111,43 +162,195 @@ def load_cursor() -> Optional[str]:
 
 def save_cursor(cursor: str):
     """Save cursor to disk after successful processing."""
+    CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURSOR_FILE.write_text(cursor)
 
 
 # ---------------------------------------------------------------------------
-# Event Logging
+# Keyword Trigger Detection
 # ---------------------------------------------------------------------------
 
-def log_event(event_type: str, data: dict):
-    """Append an event to the JSONL log file."""
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event": event_type,
-        "data": data,
-    }
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+class TriggerDetector:
+    """Detects the activation keyword in utterance text."""
+
+    def __init__(self, triggers: list[str]):
+        # Build regex patterns for each trigger (case-insensitive, word boundary)
+        self.patterns = []
+        for trigger in triggers:
+            # Allow fuzzy spacing and common mishearings
+            pattern = re.compile(
+                r'\b' + re.escape(trigger).replace(r'\ ', r'\s+') + r'\b',
+                re.IGNORECASE,
+            )
+            self.patterns.append(pattern)
+
+    def detect(self, text: str) -> tuple[bool, str]:
+        """
+        Check if text contains a trigger keyword.
+        Returns (triggered, remaining_text_after_trigger).
+        """
+        for pattern in self.patterns:
+            match = pattern.search(text)
+            if match:
+                # Everything after the trigger word is the start of the command
+                remaining = text[match.end():].strip()
+                return True, remaining
+        return False, ""
 
 
 # ---------------------------------------------------------------------------
-# Event Handlers
+# Command Capture State Machine
+# ---------------------------------------------------------------------------
+
+class CommandCapture:
+    """
+    After the trigger keyword is detected, captures subsequent utterances
+    as a voice command until silence timeout or capture window expires.
+    """
+
+    def __init__(self, initial_text: str = ""):
+        self.started_at = time.time()
+        self.last_utterance_at = time.time()
+        self.fragments: list[str] = []
+        if initial_text:
+            self.fragments.append(initial_text)
+
+    def add_utterance(self, text: str):
+        """Add a new utterance to the command being captured."""
+        self.fragments.append(text)
+        self.last_utterance_at = time.time()
+
+    def is_expired(self) -> bool:
+        """Check if the capture window has expired."""
+        now = time.time()
+        elapsed = now - self.started_at
+        silence = now - self.last_utterance_at
+        return elapsed > COMMAND_CAPTURE_WINDOW_SEC or silence > COMMAND_SILENCE_TIMEOUT_SEC
+
+    def get_command(self) -> str:
+        """Get the full captured command text."""
+        return " ".join(self.fragments).strip()
+
+
+# ---------------------------------------------------------------------------
+# Inbox Writer — writes structured files for OpenCLAW to consume
+# ---------------------------------------------------------------------------
+
+class InboxWriter:
+    """Writes events to the inbox directory for OpenCLAW processing."""
+
+    def __init__(self, inbox_dir: Path):
+        self.inbox = inbox_dir
+        ensure_dirs(self.inbox)
+
+    def write_command(self, command_text: str, context_utterances: list[dict]):
+        """Write a voice command to the commands queue."""
+        filename = f"cmd-{ts_file()}.json"
+        payload = {
+            "type": "voice_command",
+            "command": command_text,
+            "timestamp": ts_iso(),
+            "context": context_utterances[-10:],  # last 10 utterances for context
+        }
+        path = self.inbox / COMMANDS_DIR_NAME / filename
+        path.write_text(json.dumps(payload, indent=2))
+        return path
+
+    def write_conversation_end(self, conv_id: str, summary: str, utterances: list[dict]):
+        """Write a completed conversation for processing."""
+        filename = f"conv-{conv_id}-{ts_file()}.json"
+        payload = {
+            "type": "conversation_ended",
+            "conversation_id": conv_id,
+            "summary": summary,
+            "utterance_count": len(utterances),
+            "utterances": utterances,
+            "timestamp": ts_iso(),
+        }
+        path = self.inbox / CONVERSATIONS_DIR_NAME / filename
+        path.write_text(json.dumps(payload, indent=2))
+        return path
+
+    def write_journal(self, journal_id: str, text: str, state: str):
+        """Write a journal entry (dictated note) for processing."""
+        filename = f"journal-{ts_file()}.json"
+        payload = {
+            "type": "journal_note",
+            "journal_id": journal_id,
+            "text": text,
+            "state": state,
+            "timestamp": ts_iso(),
+        }
+        path = self.inbox / JOURNALS_DIR_NAME / filename
+        path.write_text(json.dumps(payload, indent=2))
+        return path
+
+    def write_thought_digest(self, utterances: list[dict], todos: list[dict],
+                              active_conversations: dict):
+        """Write a periodic thought collation digest."""
+        filename = f"thoughts-{ts_file()}.json"
+        payload = {
+            "type": "thought_digest",
+            "timestamp": ts_iso(),
+            "recent_utterances": utterances[-50:],
+            "active_conversations": list(active_conversations.values()),
+            "pending_todos": todos,
+            "instruction": (
+                "Collate these recent utterances into: (1) key themes/topics discussed, "
+                "(2) any action items or commitments mentioned, (3) important information "
+                "to remember, (4) suggested todos. Write the output as a structured summary."
+            ),
+        }
+        path = self.inbox / THOUGHTS_DIR_NAME / filename
+        path.write_text(json.dumps(payload, indent=2))
+        return path
+
+
+# ---------------------------------------------------------------------------
+# Event Handler — the brain
 # ---------------------------------------------------------------------------
 
 class EventHandler:
-    """Processes Bee events and generates alerts/summaries."""
+    """Processes Bee events with keyword detection and ambient intelligence."""
 
-    def __init__(self, webhook_url: Optional[str] = None, quiet: bool = False):
+    def __init__(self, inbox: InboxWriter, triggers: list[str],
+                 webhook_url: Optional[str] = None, quiet: bool = False):
+        self.inbox = inbox
+        self.trigger = TriggerDetector(triggers)
         self.webhook_url = webhook_url
         self.quiet = quiet
+
+        # State
         self.active_conversations: dict[str, dict] = {}
-        self.recent_utterances: list[dict] = []
+        self.conversation_utterances: dict[str, list[dict]] = {}  # conv_uuid -> utterances
+        self.recent_utterances: deque[dict] = deque(maxlen=200)
+        self.recent_todos: list[dict] = []
+        self.command_capture: Optional[CommandCapture] = None
+        self.last_collation_time: float = time.time()
+
         self.stats = {
             "utterances": 0,
             "conversations_started": 0,
             "conversations_ended": 0,
-            "todos_created": 0,
-            "journals_created": 0,
+            "journals_received": 0,
+            "commands_captured": 0,
+            "thought_digests": 0,
         }
+
+    def _print(self, msg: str):
+        if not self.quiet:
+            print(f"[{ts()}] {msg}")
+
+    def _alert(self, title: str, body: str):
+        self._print(f"🔔 {title}: {body}")
+        # macOS notification
+        try:
+            subprocess.run([
+                "osascript", "-e",
+                f'display notification "{body[:200]}" with title "Bee: {title}"'
+            ], capture_output=True, timeout=5)
+        except Exception:
+            pass
 
     def handle_event(self, event_type: str, data: dict):
         """Route an event to the appropriate handler."""
@@ -172,173 +375,276 @@ class EventHandler:
         handler = handler_map.get(event_type)
         if handler:
             handler(data)
-        elif not self.quiet:
-            self._print(f"[{event_type}] {json.dumps(data)[:200]}")
 
-    def _print(self, msg: str):
-        """Print a formatted message with timestamp."""
-        if not self.quiet:
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"[{ts}] {msg}")
+        # Check if we should finalize a pending command capture
+        self._check_command_capture()
 
-    def _alert(self, title: str, body: str):
-        """Send a high-priority alert."""
-        self._print(f"🔔 {title}: {body}")
-        if self.webhook_url:
-            self._send_webhook({"alert": title, "body": body})
+        # Check if we should write a thought digest
+        self._check_collation()
 
-    def _send_webhook(self, payload: dict):
-        """Send event data to a webhook endpoint."""
-        if not self.webhook_url:
-            return
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                self.webhook_url,
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"[WEBHOOK ERROR] {e}", file=sys.stderr)
-
-    # --- Event Handlers ---
-
-    def _on_connected(self, data: dict):
-        self._print("Connected to Bee event stream")
+    # --- Core: Utterance handling with keyword detection ---
 
     def _on_utterance(self, data: dict):
         utterance = data.get("utterance", {})
-        speaker = utterance.get("speaker", "unknown")
+        # "speaker" may be absent in single-person conversations
+        speaker = utterance.get("speaker", "me")
         text = utterance.get("text", "")
+        # conversation_uuid is at the top level of the event, not inside utterance
         conv_uuid = data.get("conversation_uuid", "")
+        spoken_at = utterance.get("spoken_at", ts_iso())
 
         self.stats["utterances"] += 1
-        self.recent_utterances.append({
+        entry = {
             "speaker": speaker,
             "text": text,
             "conversation_uuid": conv_uuid,
-            "time": datetime.now(timezone.utc).isoformat(),
-        })
-        # Keep only last 100 utterances in memory
-        if len(self.recent_utterances) > 100:
-            self.recent_utterances = self.recent_utterances[-100:]
+            "spoken_at": spoken_at,
+            "time": ts_iso(),
+        }
+        self.recent_utterances.append(entry)
+
+        # Track per-conversation utterances
+        if conv_uuid:
+            if conv_uuid not in self.conversation_utterances:
+                self.conversation_utterances[conv_uuid] = []
+            self.conversation_utterances[conv_uuid].append(entry)
 
         self._print(f"💬 [{speaker}] {text[:120]}")
 
+        # --- KEYWORD DETECTION ---
+        if self.command_capture is not None:
+            # We're actively capturing a command — add this utterance
+            self.command_capture.add_utterance(text)
+            self._print(f"  🎤 [capturing command] {text[:80]}")
+        else:
+            # Check if this utterance contains the trigger keyword
+            triggered, remaining = self.trigger.detect(text)
+            if triggered:
+                self._print(f"  ⚡ TRIGGER DETECTED! Starting command capture...")
+                self._alert("OpenCLAW Activated", f"Listening for command... ({remaining[:50]})")
+                self.command_capture = CommandCapture(initial_text=remaining)
+
+    def _check_command_capture(self):
+        """Check if an active command capture has expired, and finalize it."""
+        if self.command_capture is None:
+            return
+        if not self.command_capture.is_expired():
+            return
+
+        command_text = self.command_capture.get_command()
+        self.command_capture = None
+
+        if not command_text.strip():
+            self._print("  🎤 Command capture expired with no content.")
+            return
+
+        self.stats["commands_captured"] += 1
+        self._print(f"  🎤 COMMAND CAPTURED: {command_text[:200]}")
+        self._alert("Command Captured", command_text[:100])
+
+        # Write to inbox
+        context = list(self.recent_utterances)[-15:]
+        path = self.inbox.write_command(command_text, context)
+        self._print(f"  📥 Written to: {path}")
+
+    # --- Conversations ---
+
+    def _on_connected(self, data: dict):
+        self._print("Connected to Bee event stream")
+        self._alert("Bee Connected", "Real-time monitoring active")
+
     def _on_new_conversation(self, data: dict):
         conv = data.get("conversation", {})
-        conv_id = conv.get("id", "?")
+        conv_id = str(conv.get("id", "?"))
+        # Real field is "conversation_uuid", not "uuid"
+        conv_uuid = conv.get("conversation_uuid") or conv.get("uuid", conv_id)
         self.stats["conversations_started"] += 1
-        self.active_conversations[str(conv_id)] = {
-            "id": conv_id,
-            "start_time": datetime.now(timezone.utc).isoformat(),
+        self.active_conversations[conv_id] = {
+            "id": conv.get("id"),
+            "uuid": conv_uuid,
             "state": conv.get("state", "unknown"),
+            "title": conv.get("title", ""),
+            "short_summary": "",
+            "started": ts_iso(),
         }
-        self._print(f"🟢 New conversation started (id={conv_id})")
+        self.conversation_utterances[conv_uuid] = []
+        self._print(f"🟢 New conversation started (id={conv_id}, uuid={conv_uuid[:8]}...)")
+        self._alert("Conversation Started", f"ID {conv_id}")
 
     def _on_update_conversation(self, data: dict):
         conv = data.get("conversation", {})
         conv_id = str(conv.get("id", "?"))
+        conv_uuid = conv.get("conversation_uuid") or conv.get("uuid", conv_id)
         state = conv.get("state", "unknown")
         title = conv.get("title", "")
         summary = conv.get("short_summary", "")
 
         if state in ("completed", "ended", "finalized"):
             self.stats["conversations_ended"] += 1
-            self.active_conversations.pop(conv_id, None)
-            self._alert(
-                "Conversation ended",
-                f"ID {conv_id}: {title or summary or '(no summary yet)'}",
-            )
+            conv_data = self.active_conversations.pop(conv_id, {})
+            utterances = self.conversation_utterances.pop(conv_uuid, [])
+
+            self._alert("Conversation Ended", f"{title or summary or f'ID {conv_id}'}")
+
+            # Write full conversation to inbox for processing
+            full_summary = summary or title or "(no summary)"
+            path = self.inbox.write_conversation_end(conv_id, full_summary, utterances)
+            self._print(f"  📥 Conversation written to: {path} ({len(utterances)} utterances)")
         else:
             if conv_id in self.active_conversations:
                 self.active_conversations[conv_id]["state"] = state
+                if title:
+                    self.active_conversations[conv_id]["title"] = title
+                if summary:
+                    self.active_conversations[conv_id]["short_summary"] = summary
             if title:
                 self._print(f"📝 Conversation {conv_id} updated: {title[:100]}")
 
     def _on_update_summary(self, data: dict):
-        conv_id = data.get("conversation_id", "?")
+        conv_id = str(data.get("conversation_id", "?"))
         summary = data.get("short_summary", "")
-        if summary:
-            self._print(f"📋 Summary for conversation {conv_id}: {summary[:150]}")
+        if conv_id in self.active_conversations and summary:
+            self.active_conversations[conv_id]["short_summary"] = summary
+            self._print(f"📋 Summary for {conv_id}: {summary[:120]}")
 
     def _on_delete_conversation(self, data: dict):
         conv = data.get("conversation", {})
         conv_id = str(conv.get("id", "?"))
         self.active_conversations.pop(conv_id, None)
-        self._print(f"🗑️ Conversation {conv_id} deleted")
+
+    # --- Todos ---
 
     def _on_todo_created(self, data: dict):
         todo = data.get("todo", {})
         text = todo.get("text", "")
-        self.stats["todos_created"] += 1
-        self._alert("New todo", text[:200])
+        self.recent_todos.append({"id": todo.get("id"), "text": text, "completed": False})
+        self._alert("New Todo", text[:200])
 
     def _on_todo_updated(self, data: dict):
         todo = data.get("todo", {})
-        text = todo.get("text", "")
-        completed = todo.get("completed", False)
-        if completed:
-            self._print(f"✅ Todo completed: {text[:100]}")
-        else:
-            self._print(f"📌 Todo updated: {text[:100]}")
+        if todo.get("completed"):
+            self._print(f"✅ Todo completed: {todo.get('text', '')[:100]}")
 
     def _on_todo_deleted(self, data: dict):
-        todo = data.get("todo", {})
-        self._print(f"🗑️ Todo {todo.get('id', '?')} deleted")
+        pass  # quiet
+
+    # --- Journals (dictated notes — HIGH PRIORITY) ---
 
     def _on_journal_created(self, data: dict):
         journal = data.get("journal", {})
         state = journal.get("state", "unknown")
-        self.stats["journals_created"] += 1
-        self._print(f"📓 New journal entry (state={state})")
+        self.stats["journals_received"] += 1
+        self._print(f"📓 Journal recording started (state={state})")
+        self._alert("Note Recording", "Dictation in progress...")
 
     def _on_journal_updated(self, data: dict):
         journal = data.get("journal", {})
         state = journal.get("state", "unknown")
         text = journal.get("text", "")
+        journal_id = str(journal.get("id", "unknown"))
+
         if state == "READY" and text:
-            self._alert("Journal ready", text[:200])
-        else:
-            self._print(f"📓 Journal updated (state={state})")
+            self._alert("Note Ready", text[:150])
+            # Write to inbox immediately
+            path = self.inbox.write_journal(journal_id, text, state)
+            self._print(f"  📥 Journal written to: {path}")
 
     def _on_journal_text(self, data: dict):
         text = data.get("text", "")
-        self._print(f"📓 Journal text: {text[:150]}")
+        journal_id = str(data.get("journalId", "unknown"))
+        if text:
+            self._print(f"📓 Journal text: {text[:150]}")
+            # Write partial transcription too
+            path = self.inbox.write_journal(journal_id, text, "TRANSCRIBING")
+            self._print(f"  📥 Journal text written to: {path}")
+
+    # --- Location ---
 
     def _on_location_update(self, data: dict):
         loc = data.get("location", {})
         name = loc.get("name", "")
-        lat = loc.get("latitude", "?")
-        lng = loc.get("longitude", "?")
         if name:
             self._print(f"📍 Location: {name}")
-        else:
-            self._print(f"📍 Location: {lat}, {lng}")
 
-    def get_status(self) -> dict:
-        """Return current monitoring status."""
-        return {
-            "active_conversations": len(self.active_conversations),
-            "recent_utterances": len(self.recent_utterances),
+    # --- Ambient Intelligence: Periodic thought collation ---
+
+    def _check_collation(self):
+        """Periodically write a thought digest for OpenCLAW to process."""
+        elapsed = time.time() - self.last_collation_time
+        if elapsed < COLLATION_INTERVAL_SEC:
+            return
+        if len(self.recent_utterances) < 5:
+            return  # not enough content to collate
+
+        self.last_collation_time = time.time()
+        self.stats["thought_digests"] += 1
+
+        path = self.inbox.write_thought_digest(
+            list(self.recent_utterances),
+            self.recent_todos,
+            self.active_conversations,
+        )
+        self._print(f"🧠 Thought digest written to: {path}")
+
+    def save_state(self):
+        """Persist current state to disk for recovery."""
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "timestamp": ts_iso(),
             "stats": self.stats,
+            "active_conversations": self.active_conversations,
+            "recent_todos": self.recent_todos[-20:],
         }
+        STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 # ---------------------------------------------------------------------------
-# Stream Mode: Connect to bee stream and process SSE events
+# SSE Event Type Inference
 # ---------------------------------------------------------------------------
 
-async def stream_mode(handler: EventHandler, event_types: Optional[list[str]] = None):
+def infer_event_type(data: dict) -> str:
+    """Determine the event type — uses the 'type' field from the stream
+    when present, falls back to payload inference for older formats."""
+    # The real bee stream --json includes a "type" field directly
+    if "type" in data:
+        return data["type"]
+    # Connection event is just {"timestamp": ...}
+    if "timestamp" in data and len(data) == 1:
+        return "connected"
+    # Fallback: infer from payload structure
+    if "utterance" in data:
+        return "new-utterance"
+    if "conversation" in data:
+        conv = data["conversation"]
+        state = conv.get("state", "")
+        if state in ("completed", "ended", "finalized"):
+            return "update-conversation"
+        return "new-conversation"
+    if "short_summary" in data and "conversation_id" in data:
+        return "update-conversation-summary"
+    if "todo" in data:
+        return "todo-updated" if data["todo"].get("completed") else "todo-created"
+    if "journal" in data:
+        return "journal-updated" if data["journal"].get("state") == "READY" else "journal-created"
+    if "location" in data:
+        return "update-location"
+    if "journalId" in data:
+        return "journal-text" if "text" in data else "journal-deleted"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Stream Mode
+# ---------------------------------------------------------------------------
+
+async def stream_mode(handler: EventHandler):
     """Connect to the Bee SSE event stream and process events in real-time."""
     args = [BEE_CLI, "stream", "--json"]
-    if event_types:
-        args.extend(["--types", ",".join(event_types)])
 
     handler._print("Starting Bee event stream...")
-    handler._print(f"Command: {' '.join(args)}")
+    handler._print(f"Trigger keywords: {DEFAULT_TRIGGERS}")
+    handler._print(f"Inbox: {handler.inbox.inbox}")
+    delay = 3
 
     while True:
         try:
@@ -348,6 +654,7 @@ async def stream_mode(handler: EventHandler, event_types: Optional[list[str]] = 
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "NO_COLOR": "1"},
             )
+            delay = 3  # reset on successful connect
 
             async for line in proc.stdout:
                 text = line.decode().strip()
@@ -355,19 +662,15 @@ async def stream_mode(handler: EventHandler, event_types: Optional[list[str]] = 
                     continue
                 try:
                     data = json.loads(text)
-                    # The stream --json output is raw event data
-                    # We need to determine the event type from the data
-                    event_type = _infer_event_type(data)
+                    event_type = infer_event_type(data)
                     handler.handle_event(event_type, data)
                 except json.JSONDecodeError:
-                    # Not JSON — might be a status message
-                    if not handler.quiet:
-                        handler._print(f"[raw] {text[:200]}")
+                    pass
 
-            # Process exited
             return_code = await proc.wait()
-            handler._print(f"Stream ended (exit code {return_code}). Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            handler._print(f"Stream ended (exit {return_code}). Reconnecting in {delay}s...")
+            handler.save_state()
+            await asyncio.sleep(delay)
 
         except asyncio.CancelledError:
             handler._print("Stream cancelled")
@@ -375,37 +678,14 @@ async def stream_mode(handler: EventHandler, event_types: Optional[list[str]] = 
                 proc.terminate()
             break
         except Exception as e:
-            handler._print(f"Stream error: {e}. Reconnecting in 10s...")
-            await asyncio.sleep(10)
+            handler._print(f"Stream error: {e}. Reconnecting in {delay}s...")
+            await asyncio.sleep(delay)
 
-
-def _infer_event_type(data: dict) -> str:
-    """Infer the SSE event type from the JSON data structure."""
-    if "utterance" in data:
-        return "new-utterance"
-    if "conversation" in data:
-        conv = data["conversation"]
-        state = conv.get("state", "")
-        if state in ("completed", "ended"):
-            return "update-conversation"
-        return "new-conversation"
-    if "todo" in data:
-        return "todo-created"
-    if "journal" in data:
-        return "journal-created"
-    if "location" in data:
-        return "update-location"
-    if "short_summary" in data and "conversation_id" in data:
-        return "update-conversation-summary"
-    if "journalId" in data:
-        if "text" in data:
-            return "journal-text"
-        return "journal-deleted"
-    return "unknown"
+        delay = min(delay * 2, 60)
 
 
 # ---------------------------------------------------------------------------
-# Poll Mode: Periodically check for changes
+# Poll Mode
 # ---------------------------------------------------------------------------
 
 async def poll_mode(handler: EventHandler, interval: int = 60):
@@ -424,77 +704,52 @@ async def poll_mode(handler: EventHandler, interval: int = 60):
                 meta = data.get("meta", {})
                 next_cursor = meta.get("next_cursor")
 
-                # Process each category of changes
-                for fact in data.get("facts", []):
-                    handler._alert("Fact changed", fact.get("text", "")[:200])
-
-                for todo in data.get("todos", []):
-                    text = todo.get("text", "")
-                    completed = todo.get("completed", False)
-                    if completed:
-                        handler._print(f"✅ Todo completed: {text[:100]}")
-                    else:
-                        handler._alert("Todo update", text[:200])
-
                 for conv in data.get("conversations", []):
-                    summary = conv.get("summary", "")
-                    handler._print(f"💬 Conversation {conv.get('id', '?')}: {(summary or '(no summary)')[:150]}")
+                    handler._print(f"💬 Changed conversation {conv.get('id', '?')}")
 
                 for journal in data.get("journals", []):
                     text = journal.get("text", "")
-                    handler._print(f"📓 Journal: {(text or '(processing)')[:150]}")
+                    if text:
+                        handler.inbox.write_journal(
+                            str(journal.get("id", "unknown")), text, "READY"
+                        )
+                        handler._print(f"📓 Journal detected via poll: {text[:100]}")
 
-                for daily in data.get("dailies", []):
-                    summary = daily.get("summary", "")
-                    handler._print(f"📅 Daily: {(summary or '(no summary)')[:150]}")
+                for todo in data.get("todos", []):
+                    handler._print(f"📌 Todo change: {todo.get('text', '')[:100]}")
 
-                # Save cursor only after successful processing
                 if next_cursor:
                     save_cursor(next_cursor)
 
         except Exception as e:
             handler._print(f"Poll error: {e}")
 
+        handler.save_state()
         await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
-# Digest Mode: One-shot summary
+# Digest Mode
 # ---------------------------------------------------------------------------
 
-def digest_mode(handler: EventHandler):
+def digest_mode():
     """Generate a one-shot digest of current state."""
     print("=" * 60)
-    print("  BEE WEARABLE — CURRENT STATUS DIGEST")
-    print(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("  BEE WEARABLE — STATUS DIGEST")
+    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # Status
-    print("\n--- Authentication ---")
-    print(run_bee(["status"]))
+    for label, cmd in [
+        ("Status", ["status"]),
+        ("Today's Brief", ["today"]),
+        ("Recent Context", ["now"]),
+        ("Todos", ["todos", "list"]),
+        ("Facts", ["facts", "list", "--limit", "20"]),
+        ("Journals", ["journals", "list", "--limit", "5"]),
+    ]:
+        print(f"\n--- {label} ---")
+        print(run_bee(cmd))
 
-    # Today's brief
-    print("\n--- Today's Brief ---")
-    print(run_bee(["today"]))
-
-    # Recent conversations
-    print("\n--- Recent Conversations (last 10 hours) ---")
-    print(run_bee(["now"]))
-
-    # Open todos
-    print("\n--- Todos ---")
-    print(run_bee(["todos", "list"]))
-
-    # Recent facts
-    print("\n--- Recent Facts ---")
-    print(run_bee(["facts", "list", "--limit", "20"]))
-
-    # Recent journals
-    print("\n--- Recent Journals ---")
-    print(run_bee(["journals", "list", "--limit", "5"]))
-
-    print("\n" + "=" * 60)
-    print("  DIGEST COMPLETE")
     print("=" * 60)
 
 
@@ -504,20 +759,27 @@ def digest_mode(handler: EventHandler):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bee Wearable Monitoring Agent",
+        description="Bee Wearable Monitoring Agent for OpenCLAW",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  stream    Connect to the real-time SSE event stream (default)
-  poll      Periodically check for changes using `bee changed`
-  digest    Generate a one-shot summary of current state
+  stream    Real-time SSE monitoring with keyword detection (default)
+  poll      Periodic change-feed polling
+  digest    One-shot status summary
+
+The agent monitors your Bee wearable and writes structured files to the
+inbox directory (~/.bee-agent/inbox/) for OpenCLAW to process:
+  - commands/   Voice commands triggered by saying "OpenCLAW"
+  - conversations/  Completed conversation transcripts
+  - journals/   Dictated notes
+  - thoughts/   Periodic thought digests for collation
 
 Examples:
-  %(prog)s                                    # Start streaming
-  %(prog)s --mode stream --types new-utterance,todo-created
-  %(prog)s --mode poll --interval 120         # Poll every 2 minutes
-  %(prog)s --mode digest                      # One-shot summary
-  %(prog)s --webhook-url https://hooks.example.com/bee
+  %(prog)s                                # Start streaming
+  %(prog)s --trigger "hey claude"         # Custom trigger word
+  %(prog)s --inbox /path/to/inbox         # Custom inbox directory
+  %(prog)s --mode poll --interval 120     # Poll every 2 minutes
+  %(prog)s --mode digest                  # One-shot summary
         """,
     )
     parser.add_argument(
@@ -525,16 +787,20 @@ Examples:
         default="stream", help="Monitoring mode (default: stream)",
     )
     parser.add_argument(
-        "--interval", type=int, default=60,
-        help="Poll interval in seconds (poll mode only, default: 60)",
+        "--trigger", type=str, default="",
+        help="Additional trigger keyword(s), comma-separated (added to defaults)",
     )
     parser.add_argument(
-        "--types", type=str, default="",
-        help="Comma-separated event types to filter (stream mode only)",
+        "--inbox", type=str, default=str(DEFAULT_INBOX_DIR),
+        help=f"Inbox directory for output files (default: {DEFAULT_INBOX_DIR})",
+    )
+    parser.add_argument(
+        "--interval", type=int, default=60,
+        help="Poll interval in seconds (poll mode, default: 60)",
     )
     parser.add_argument(
         "--webhook-url", type=str, default="",
-        help="URL to forward events to via POST webhook",
+        help="URL to forward alerts via POST webhook",
     )
     parser.add_argument(
         "--quiet", action="store_true",
@@ -542,20 +808,31 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.mode == "digest":
+        digest_mode()
+        return
+
+    # Build trigger list
+    triggers = list(DEFAULT_TRIGGERS)
+    if args.trigger:
+        triggers.extend([t.strip() for t in args.trigger.split(",") if t.strip()])
+
+    inbox_dir = Path(args.inbox)
+    inbox = InboxWriter(inbox_dir)
     handler = EventHandler(
+        inbox=inbox,
+        triggers=triggers,
         webhook_url=args.webhook_url or None,
         quiet=args.quiet,
     )
 
-    if args.mode == "digest":
-        digest_mode(handler)
-        return
-
-    # Set up graceful shutdown
+    # Graceful shutdown
     loop = asyncio.new_event_loop()
 
     def shutdown(sig):
         handler._print(f"Received {sig.name}, shutting down...")
+        handler.save_state()
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
@@ -564,16 +841,14 @@ Examples:
 
     try:
         if args.mode == "stream":
-            event_types = [t.strip() for t in args.types.split(",") if t.strip()] or None
-            loop.run_until_complete(stream_mode(handler, event_types))
+            loop.run_until_complete(stream_mode(handler))
         elif args.mode == "poll":
             loop.run_until_complete(poll_mode(handler, args.interval))
     except asyncio.CancelledError:
         pass
     finally:
-        handler._print("Agent stopped")
-        status = handler.get_status()
-        handler._print(f"Session stats: {json.dumps(status['stats'])}")
+        handler.save_state()
+        handler._print(f"Session stats: {json.dumps(handler.stats)}")
         loop.close()
 
 
