@@ -78,7 +78,7 @@ if ! bee status &>/dev/null 2>&1; then
     echo "  Run 'bee login' to authenticate, then re-run this installer."
     exit 1
 fi
-BEE_USER=$(bee status 2>/dev/null | grep -oP 'Verified as \K.*' || echo "authenticated")
+BEE_USER=$(bee status 2>/dev/null | sed -n 's/.*Verified as //p' || echo "authenticated")
 echo -e "  ${GREEN}✓${NC} Bee authenticated as: $BEE_USER"
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ if [ "$(uname)" = "Darwin" ]; then
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:$HOME/.bun/bin:$HOME/.nvm/versions/node/$(node -v 2>/dev/null || echo "v20.0.0")/bin</string>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.bun/bin:$(dirname "$(which node 2>/dev/null)" 2>/dev/null || echo "/usr/local/bin")</string>
         <key>PYTHONPATH</key>
         <string>$BEE_AGENT_DIR/standalone_agent</string>
     </dict>

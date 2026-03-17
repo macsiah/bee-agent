@@ -24,6 +24,7 @@ Requirements:
 """
 
 import asyncio
+import glob as globmod
 import json
 import os
 import subprocess
@@ -55,10 +56,13 @@ def _find_bee_cli() -> str:
     candidates = [
         "bee",
         os.path.expanduser("~/.bun/bin/bee"),
-        os.path.expanduser("~/.nvm/versions/node/*/bin/bee"),
         "/usr/local/bin/bee",
         "/opt/homebrew/bin/bee",
     ]
+    # Expand nvm glob pattern to actual paths
+    nvm_matches = globmod.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/bee"))
+    candidates.extend(nvm_matches)
+
     for candidate in candidates:
         try:
             result = subprocess.run(
@@ -318,6 +322,7 @@ async def _run_stream(cache: LiveStreamCache):
     Auto-reconnects with exponential backoff on disconnection.
     """
     delay = STREAM_RECONNECT_BASE_DELAY
+    proc = None
 
     while True:
         try:
@@ -346,7 +351,7 @@ async def _run_stream(cache: LiveStreamCache):
 
         except asyncio.CancelledError:
             cache.connected = False
-            if proc and proc.returncode is None:
+            if proc is not None and proc.returncode is None:
                 proc.terminate()
             return
         except Exception:

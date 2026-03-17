@@ -34,6 +34,7 @@ Requirements:
 
 import argparse
 import asyncio
+import glob as globmod
 import json
 import os
 import re
@@ -45,6 +46,8 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
+
+from dataclasses import asdict
 
 from bee_classifier import BeeClassifier, ContentRouter, classify_and_route, ClassificationResult
 from bee_actions import CommandParser, ActionWriter, ActionExecutor, ActionRequest
@@ -77,8 +80,17 @@ DEFAULT_TRIGGERS = ["openclaw", "open claw", "hey openclaw", "hey open claw"]
 
 def find_bee_cli() -> str:
     """Locate the bee CLI binary."""
-    for candidate in ["bee", os.path.expanduser("~/.bun/bin/bee"), "/usr/local/bin/bee",
-                       os.path.expanduser("~/.nvm/versions/node/*/bin/bee"), "/opt/homebrew/bin/bee"]:
+    candidates = [
+        "bee",
+        os.path.expanduser("~/.bun/bin/bee"),
+        "/usr/local/bin/bee",
+        "/opt/homebrew/bin/bee",
+    ]
+    # Expand nvm glob pattern to actual paths
+    nvm_matches = globmod.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/bee"))
+    candidates.extend(nvm_matches)
+
+    for candidate in candidates:
         try:
             result = subprocess.run(
                 [candidate, "--version"],
@@ -144,7 +156,7 @@ def ts_file() -> str:
 
 def ensure_dirs(inbox: Path):
     """Create the inbox directory structure."""
-    for subdir in [COMMANDS_DIR_NAME, CONVERSATIONS_DIR_NAME, JOURNALS_DIR_NAME, THOUGHTS_DIR_NAME]:
+    for subdir in [COMMANDS_DIR_NAME, CONVERSATIONS_DIR_NAME, JOURNALS_DIR_NAME, THOUGHTS_DIR_NAME, "actions"]:
         (inbox / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -373,6 +385,18 @@ class EventHandler:
                 self._print(f"  ⚠️  Priority: {cl.priority}")
         except Exception as e:
             self._print(f"  ⚠️  Classification error: {e}")
+
+    def _check_trigger_in_text(self, text: str, source: str = "text"):
+        """Check for trigger keyword in text and start command capture if found."""
+        if self.command_capture is not None:
+            self.command_capture.add_utterance(text)
+            self._print(f"  🎤 [capturing command from {source}] {text[:80]}")
+        else:
+            triggered, remaining = self.trigger.detect(text)
+            if triggered:
+                self._print(f"  ⚡ TRIGGER DETECTED in {source}! Starting command capture...")
+                self._alert("OpenCLAW Activated", f"Listening for command... ({remaining[:50]})")
+                self.command_capture = CommandCapture(initial_text=remaining)
 
     def _check_digest(self):
         """Periodically generate a daily digest."""
@@ -661,15 +685,7 @@ class EventHandler:
             })
 
             # --- KEYWORD DETECTION in finalized journal ---
-            if self.command_capture is not None:
-                self.command_capture.add_utterance(text)
-                self._print(f"  🎤 [capturing command from journal] {text[:80]}")
-            else:
-                triggered, remaining = self.trigger.detect(text)
-                if triggered:
-                    self._print(f"  ⚡ TRIGGER DETECTED in journal! Starting command capture...")
-                    self._alert("OpenCLAW Activated", f"Listening for command... ({remaining[:50]})")
-                    self.command_capture = CommandCapture(initial_text=remaining)
+            self._check_trigger_in_text(text, source="journal")
 
     def _on_journal_text(self, data: dict):
         text = data.get("text", "")
@@ -681,15 +697,7 @@ class EventHandler:
             self._print(f"  📥 Journal text written to: {path}")
 
             # --- KEYWORD DETECTION in journal text ---
-            if self.command_capture is not None:
-                self.command_capture.add_utterance(text)
-                self._print(f"  🎤 [capturing command from journal] {text[:80]}")
-            else:
-                triggered, remaining = self.trigger.detect(text)
-                if triggered:
-                    self._print(f"  ⚡ TRIGGER DETECTED in journal! Starting command capture...")
-                    self._alert("OpenCLAW Activated", f"Listening for command... ({remaining[:50]})")
-                    self.command_capture = CommandCapture(initial_text=remaining)
+            self._check_trigger_in_text(text, source="journal-text")
 
     # --- Location ---
 
@@ -778,6 +786,7 @@ async def stream_mode(handler: EventHandler):
     handler._print(f"Trigger keywords: {DEFAULT_TRIGGERS}")
     handler._print(f"Inbox: {handler.inbox.inbox}")
     delay = 3
+    proc = None
 
     while True:
         try:
@@ -807,7 +816,7 @@ async def stream_mode(handler: EventHandler):
 
         except asyncio.CancelledError:
             handler._print("Stream cancelled")
-            if proc and proc.returncode is None:
+            if proc is not None and proc.returncode is None:
                 proc.terminate()
             break
         except Exception as e:
