@@ -1157,6 +1157,701 @@ async def bee_sync_to_markdown(output_dir: str = "./bee-sync", targets: str = ""
     return await _run_bee(args, timeout=120)
 
 
+# ======================== SPEAKERS ========================
+
+class SpeakerCreateInput(BaseModel):
+    """Parameters for creating a speaker profile."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(..., description="Name for the speaker profile", min_length=1, max_length=200)
+    notes: str = Field(default="", description="Optional notes (e.g., relationship, context)")
+
+
+@mcp.tool(
+    name="bee_list_speakers",
+    annotations={
+        "title": "List Speaker Profiles",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_list_speakers() -> str:
+    """List all speaker profiles that have been created for identification.
+
+    Speaker profiles map real names to the generic 'Speaker 0' / 'Speaker 1'
+    labels in Bee transcripts. After profiles are created and trained, Bee can
+    auto-identify who is speaking in new conversations.
+
+    Returns:
+        str: List of speaker profiles with names, notes, and fingerprint status.
+    """
+    return await _run_bee(["speakers", "list"])
+
+
+@mcp.tool(
+    name="bee_create_speaker",
+    annotations={
+        "title": "Create Speaker Profile",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def bee_create_speaker(params: SpeakerCreateInput) -> str:
+    """Create a new speaker profile for someone the owner regularly talks to.
+
+    After creating a profile, assign it to speaker labels in known conversations,
+    then use bee_learn_speakers to build speech fingerprints for auto-identification.
+
+    Args:
+        params: Speaker name and optional notes (e.g., 'Wife', 'Manager at work').
+
+    Returns:
+        str: Confirmation of profile creation.
+    """
+    args = ["speakers", "create", "--name", params.name]
+    if params.notes:
+        args.extend(["--notes", params.notes])
+    return await _run_bee(args)
+
+
+@mcp.tool(
+    name="bee_delete_speaker",
+    annotations={
+        "title": "Delete Speaker Profile",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_delete_speaker(name: str) -> str:
+    """Delete a speaker profile and its learned fingerprints.
+
+    Args:
+        name: The speaker profile name to delete.
+
+    Returns:
+        str: Confirmation of deletion.
+    """
+    return await _run_bee(["speakers", "delete", name])
+
+
+@mcp.tool(
+    name="bee_assign_speaker",
+    annotations={
+        "title": "Assign Speaker in Conversation",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_assign_speaker(conversation_id: int, speaker_label: str, profile_name: str) -> str:
+    """Assign a speaker label in a conversation to a named profile.
+
+    Maps generic labels like 'Speaker 0' to real names like 'Sarah'. This is
+    the manual step that trains the AI — the more conversations you assign,
+    the better auto-identification becomes.
+
+    Args:
+        conversation_id: The conversation containing the speaker.
+        speaker_label: The label to assign (e.g., 'Speaker 0', 'Speaker 1').
+        profile_name: The speaker profile name to assign it to.
+
+    Returns:
+        str: Confirmation of assignment.
+    """
+    return await _run_bee(["speakers", "assign", str(conversation_id), speaker_label, profile_name])
+
+
+@mcp.tool(
+    name="bee_identify_speakers",
+    annotations={
+        "title": "AI Speaker Identification",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_identify_speakers(conversation_id: int) -> str:
+    """Use AI to identify speakers in a conversation based on learned fingerprints.
+
+    Analyzes utterances and matches them against known speaker profiles.
+    Speakers identified with 80%+ confidence are automatically assigned.
+    Requires an AI provider to be configured (see bee_config_set).
+
+    Args:
+        conversation_id: The conversation to analyze.
+
+    Returns:
+        str: Identification results with confidence scores per speaker.
+    """
+    return await _run_bee(["speakers", "identify", str(conversation_id)], timeout=60)
+
+
+@mcp.tool(
+    name="bee_learn_speakers",
+    annotations={
+        "title": "Learn Speaker Fingerprints",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_learn_speakers(profile_name: str = "", limit: int = 20) -> str:
+    """Learn speech fingerprints from conversations where speakers have been manually assigned.
+
+    Extracts vocabulary, topics, and speech patterns to build a fingerprint for
+    each speaker profile. The more assigned conversations available, the more
+    accurate future auto-identification will be.
+
+    Args:
+        profile_name: Optional — learn only for a specific profile. Empty = all profiles.
+        limit: Maximum conversations to process per profile (default 20).
+
+    Returns:
+        str: Summary of learned fingerprints per speaker.
+    """
+    args = ["speakers", "learn"]
+    if profile_name:
+        args.extend(["--profile", profile_name])
+    args.extend(["--limit", str(limit)])
+    return await _run_bee(args, timeout=120)
+
+
+# ======================== CITE (Fact Source Tracking) ========================
+
+@mcp.tool(
+    name="bee_cite_fact",
+    annotations={
+        "title": "Show Fact Citations",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_cite_fact(fact_id: int) -> str:
+    """Show which conversations support a specific fact, with relevance scores.
+
+    Traces a fact back to its source conversations with text snippets showing
+    exactly where the information was mentioned. Useful for verifying accuracy
+    or understanding context behind a fact.
+
+    Args:
+        fact_id: The fact ID to find citations for.
+
+    Returns:
+        str: Citations with conversation IDs, relevance scores, and text snippets.
+    """
+    return await _run_bee(["cite", str(fact_id)], timeout=60)
+
+
+@mcp.tool(
+    name="bee_cite_search",
+    annotations={
+        "title": "Search for Evidence",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_cite_search(query: str, limit: int = 10) -> str:
+    """Search conversations for evidence supporting or relating to a claim.
+
+    Unlike regular search, this specifically looks for citeable evidence —
+    statements, assertions, and data points that can back up a fact or claim.
+
+    Args:
+        query: The claim or topic to find evidence for.
+        limit: Maximum results to return (default 10).
+
+    Returns:
+        str: Matching conversation excerpts with relevance scores.
+    """
+    args = ["cite", "search", "--query", query, "--limit", str(limit)]
+    return await _run_bee(args, timeout=60)
+
+
+@mcp.tool(
+    name="bee_cite_rebuild",
+    annotations={
+        "title": "Rebuild Citation Index",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_cite_rebuild() -> str:
+    """Rebuild the citation index for all confirmed facts.
+
+    Re-indexes every confirmed fact against all conversations. Uses AI to
+    verify relevance when an AI provider is configured. Run this after
+    significant new conversation data has been processed.
+
+    Returns:
+        str: Summary of rebuild results (facts indexed, citations found).
+    """
+    return await _run_bee(["cite", "rebuild"], timeout=300)
+
+
+# ======================== INFER (AI Transcript Gap Filling) ========================
+
+@mcp.tool(
+    name="bee_infer_conversation",
+    annotations={
+        "title": "Infer Unclear Utterances",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_infer_conversation(conversation_id: int) -> str:
+    """Use AI to fill in unclear or low-confidence portions of a conversation transcript.
+
+    Analyzes utterances where speech recognition produced garbled or uncertain
+    text and uses surrounding context to reconstruct what was likely said.
+    Only processes low-confidence utterances. Results are stored separately
+    and never overwrite original transcriptions.
+
+    Inferred text is always marked as [AI INFERRED] — treat as best guesses.
+    Requires an AI provider to be configured (see bee_config_set).
+
+    Args:
+        conversation_id: The conversation to analyze for gaps.
+
+    Returns:
+        str: Inference results showing original vs inferred text with confidence scores.
+    """
+    return await _run_bee(["infer", str(conversation_id)], timeout=120)
+
+
+@mcp.tool(
+    name="bee_infer_list",
+    annotations={
+        "title": "List Stored Inferences",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_infer_list(conversation_id: int = 0, limit: int = 20) -> str:
+    """List stored AI inferences (gap fills) for conversations.
+
+    Shows previously inferred text alongside original transcriptions.
+    Filter by conversation or view all inferences.
+
+    Args:
+        conversation_id: Optional — filter to a specific conversation. 0 = all.
+        limit: Maximum inferences to return (default 20).
+
+    Returns:
+        str: List of inferences with original text, inferred text, and confidence.
+    """
+    args = ["infer", "list", "--limit", str(limit)]
+    if conversation_id:
+        args.extend(["--conversation", str(conversation_id)])
+    return await _run_bee(args)
+
+
+@mcp.tool(
+    name="bee_infer_clear",
+    annotations={
+        "title": "Clear Stored Inferences",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_infer_clear(conversation_id: int = 0) -> str:
+    """Clear stored AI inferences. Removes inferred text but never affects originals.
+
+    Args:
+        conversation_id: Optional — clear only for a specific conversation. 0 = all.
+
+    Returns:
+        str: Confirmation of cleared inferences.
+    """
+    args = ["infer", "clear"]
+    if conversation_id:
+        args.extend(["--conversation", str(conversation_id)])
+    return await _run_bee(args)
+
+
+# ======================== INTEGRATIONS ========================
+
+@mcp.tool(
+    name="bee_list_integrations",
+    annotations={
+        "title": "List Integrations",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_list_integrations() -> str:
+    """List all configured calendar and mail integrations.
+
+    Shows provider names, types (calendar/mail), and connection status.
+
+    Returns:
+        str: List of configured integrations.
+    """
+    return await _run_bee(["integrations", "list"])
+
+
+@mcp.tool(
+    name="bee_add_integration",
+    annotations={
+        "title": "Add Integration",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def bee_add_integration(integration_type: str) -> str:
+    """Start the interactive flow to add a calendar or mail integration.
+
+    Walks through provider selection (iCloud, Google, Outlook, or Generic),
+    server configuration, and credential setup.
+
+    Note: This command is interactive — the output will contain prompts that
+    need to be relayed to the user for input.
+
+    Args:
+        integration_type: Either 'calendar' or 'mail'.
+
+    Returns:
+        str: Interactive setup prompts and instructions.
+    """
+    if integration_type not in ("calendar", "mail"):
+        return "Error: integration_type must be 'calendar' or 'mail'"
+    return await _run_bee(["integrations", "add", integration_type], timeout=60)
+
+
+@mcp.tool(
+    name="bee_remove_integration",
+    annotations={
+        "title": "Remove Integration",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_remove_integration(name: str) -> str:
+    """Remove a configured calendar or mail integration.
+
+    Args:
+        name: The integration name to remove (from bee_list_integrations).
+
+    Returns:
+        str: Confirmation of removal.
+    """
+    return await _run_bee(["integrations", "remove", name])
+
+
+@mcp.tool(
+    name="bee_test_integration",
+    annotations={
+        "title": "Test Integration",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_test_integration(name: str) -> str:
+    """Test connectivity for a configured integration.
+
+    For calendar integrations, lists available calendars.
+    For mail integrations, fetches 3 recent messages to verify connectivity.
+
+    Args:
+        name: The integration name to test (from bee_list_integrations).
+
+    Returns:
+        str: Test results showing available calendars or sample messages.
+    """
+    return await _run_bee(["integrations", "test", name], timeout=30)
+
+
+# ======================== CALENDAR ========================
+
+@mcp.tool(
+    name="bee_list_calendars",
+    annotations={
+        "title": "List Calendars",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_list_calendars() -> str:
+    """List all available calendars from configured CalDAV providers.
+
+    Requires at least one calendar integration (set up via bee_add_integration).
+
+    Returns:
+        str: List of calendars with names and provider info.
+    """
+    return await _run_bee(["calendar", "list"])
+
+
+@mcp.tool(
+    name="bee_get_calendar_events",
+    annotations={
+        "title": "Get Calendar Events",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_get_calendar_events(from_date: str = "", to_date: str = "") -> str:
+    """View calendar events in a date range from connected CalDAV providers.
+
+    Defaults to today through 7 days ahead. Results are sorted by start time
+    and include date/time, summary, and location.
+
+    Requires at least one calendar integration (set up via bee_add_integration).
+
+    Args:
+        from_date: Start date in YYYY-MM-DD format (default: today).
+        to_date: End date in YYYY-MM-DD format (default: 7 days from start).
+
+    Returns:
+        str: Calendar events with times, titles, and locations.
+    """
+    args = ["calendar", "events"]
+    if from_date:
+        args.extend(["--from", from_date])
+    if to_date:
+        args.extend(["--to", to_date])
+    return await _run_bee(args)
+
+
+# ======================== MAIL ========================
+
+@mcp.tool(
+    name="bee_get_recent_mail",
+    annotations={
+        "title": "Get Recent Mail",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_get_recent_mail(limit: int = 20) -> str:
+    """Show recent email messages from connected IMAP providers.
+
+    Displays provider, date, sender, and subject. Sorted by date (newest first).
+    Requires at least one mail integration (set up via bee_add_integration).
+
+    Args:
+        limit: Maximum messages to return (default 20).
+
+    Returns:
+        str: Recent emails with sender, subject, and timestamps.
+    """
+    return await _run_bee(["mail", "recent", "--limit", str(limit)])
+
+
+@mcp.tool(
+    name="bee_search_mail",
+    annotations={
+        "title": "Search Mail",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def bee_search_mail(query: str, provider: str = "", limit: int = 20) -> str:
+    """Search across all connected mail integrations.
+
+    Optionally filter to a specific provider. Requires at least one mail
+    integration (set up via bee_add_integration).
+
+    Args:
+        query: Search query text.
+        provider: Optional — filter to a specific mail provider name.
+        limit: Maximum results (default 20).
+
+    Returns:
+        str: Matching emails with sender, subject, date, and provider.
+    """
+    args = ["mail", "search", "--query", query, "--limit", str(limit)]
+    if provider:
+        args.extend(["--provider", provider])
+    return await _run_bee(args)
+
+
+# ======================== CONFIG ========================
+
+@mcp.tool(
+    name="bee_config_list",
+    annotations={
+        "title": "List Configuration",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_config_list() -> str:
+    """List all Bee CLI configuration values.
+
+    Shows AI provider settings, API keys (masked), and other local config.
+
+    Returns:
+        str: Current configuration key-value pairs.
+    """
+    return await _run_bee(["config", "list"])
+
+
+@mcp.tool(
+    name="bee_config_get",
+    annotations={
+        "title": "Get Config Value",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_config_get(key: str) -> str:
+    """Get a specific configuration value.
+
+    Common keys: ai_provider, openai_api_key, anthropic_api_key.
+
+    Args:
+        key: The configuration key to read.
+
+    Returns:
+        str: The configuration value (API keys may be masked).
+    """
+    return await _run_bee(["config", "get", key])
+
+
+@mcp.tool(
+    name="bee_config_set",
+    annotations={
+        "title": "Set Config Value",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_config_set(key: str, value: str) -> str:
+    """Set a configuration value.
+
+    Required for AI-powered features (speaker identification, inference, citations):
+        bee_config_set('ai_provider', 'openai')
+        bee_config_set('openai_api_key', 'sk-...')
+
+    Or for Anthropic:
+        bee_config_set('ai_provider', 'anthropic')
+        bee_config_set('anthropic_api_key', 'sk-ant-...')
+
+    Args:
+        key: The configuration key to set.
+        value: The value to assign.
+
+    Returns:
+        str: Confirmation of the configuration change.
+    """
+    return await _run_bee(["config", "set", key, value])
+
+
+@mcp.tool(
+    name="bee_config_delete",
+    annotations={
+        "title": "Delete Config Value",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_config_delete(key: str) -> str:
+    """Delete a configuration entry.
+
+    Args:
+        key: The configuration key to remove.
+
+    Returns:
+        str: Confirmation of deletion.
+    """
+    return await _run_bee(["config", "delete", key])
+
+
+# ======================== UI (Web Dashboard) ========================
+
+@mcp.tool(
+    name="bee_launch_ui",
+    annotations={
+        "title": "Launch Web Dashboard",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def bee_launch_ui(port: int = 3773) -> str:
+    """Launch the Bee web dashboard in the owner's default browser.
+
+    Provides a full GUI for browsing conversations, managing facts/todos,
+    viewing calendar/mail, configuring AI settings, running inference,
+    and managing speaker profiles and integrations.
+
+    The dashboard runs on localhost and stops when the process is terminated.
+
+    Args:
+        port: Port to run on (default 3773).
+
+    Returns:
+        str: Confirmation that the dashboard is starting.
+    """
+    # Use a short timeout since bee ui is a long-running process —
+    # we just need to confirm it started successfully
+    args = ["ui"]
+    if port != 3773:
+        args.extend(["--port", str(port)])
+    # Start as background process, don't wait for it to finish
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            BEE_CLI, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        # Give it a moment to start
+        await asyncio.sleep(2)
+        if proc.returncode is not None:
+            stderr = (await proc.stderr.read()).decode().strip()
+            return f"Error: Dashboard failed to start — {stderr}"
+        return f"Bee dashboard starting on http://localhost:{port}"
+    except Exception as e:
+        return f"Error launching dashboard: {e}"
+
+
 # ======================== MCP RESOURCES ========================
 
 @mcp.resource("bee://status", name="bee-status", description="Authentication and connection status.")
