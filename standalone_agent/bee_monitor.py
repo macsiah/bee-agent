@@ -46,6 +46,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
 
+from bee_classifier import BeeClassifier, ContentRouter, classify_and_route, ClassificationResult
+from bee_actions import CommandParser, ActionWriter, ActionExecutor, ActionRequest
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -320,6 +323,22 @@ class EventHandler:
         self.webhook_url = webhook_url
         self.quiet = quiet
 
+        # Content classifier & router
+        self.classifier = BeeClassifier()
+        self.router = ContentRouter(
+            inbox_dir=inbox.inbox,
+            knowledge_dir=Path.home() / ".bee-agent" / "knowledge",
+            digest_dir=Path.home() / ".bee-agent" / "digests",
+            openclaw_memory_dir=Path.home() / ".openclaw" / "workspace" / "memory",
+        )
+        self.last_digest_time: float = 0.0
+        self.DIGEST_INTERVAL_SEC: float = 3600.0  # generate digest hourly
+
+        # Command parser & action executor
+        self.command_parser = CommandParser()
+        self.action_writer = ActionWriter(inbox_dir=inbox.inbox)
+        self.action_executor = ActionExecutor()
+
         # State
         self.active_conversations: dict[str, dict] = {}
         self.conversation_utterances: dict[str, list[dict]] = {}  # conv_uuid -> utterances
@@ -335,7 +354,37 @@ class EventHandler:
             "journals_received": 0,
             "commands_captured": 0,
             "thought_digests": 0,
+            "items_classified": 0,
         }
+
+    def _classify_and_route(self, text: str, source_type: str, raw_content: dict):
+        """Classify content and route to categorized folders + knowledge base + memory."""
+        try:
+            cl = self.classifier.classify(text, source_type=source_type)
+            paths = self.router.route(raw_content, cl)
+            self.stats["items_classified"] += 1
+            cat = cl.primary_category
+            conf = f"{cl.confidence:.0%}"
+            self._print(f"  🏷️  Classified as [{cat}] ({conf})")
+            if cl.action_items:
+                for item in cl.action_items:
+                    self._print(f"  📋 Action: {item[:80]}")
+            if cl.priority != "normal":
+                self._print(f"  ⚠️  Priority: {cl.priority}")
+        except Exception as e:
+            self._print(f"  ⚠️  Classification error: {e}")
+
+    def _check_digest(self):
+        """Periodically generate a daily digest."""
+        now = time.time()
+        if now - self.last_digest_time < self.DIGEST_INTERVAL_SEC:
+            return
+        self.last_digest_time = now
+        try:
+            path = self.router.generate_daily_digest()
+            self._print(f"📊 Daily digest written to: {path}")
+        except Exception as e:
+            self._print(f"⚠️  Digest error: {e}")
 
     def _print(self, msg: str):
         if not self.quiet:
@@ -381,6 +430,9 @@ class EventHandler:
 
         # Check if we should write a thought digest
         self._check_collation()
+
+        # Check if we should generate a daily digest
+        self._check_digest()
 
     # --- Core: Utterance handling with keyword detection ---
 
@@ -442,10 +494,55 @@ class EventHandler:
         self._print(f"  🎤 COMMAND CAPTURED: {command_text[:200]}")
         self._alert("Command Captured", command_text[:100])
 
-        # Write to inbox
+        # Write raw command to inbox
         context = list(self.recent_utterances)[-15:]
         path = self.inbox.write_command(command_text, context)
         self._print(f"  📥 Written to: {path}")
+
+        # --- PARSE into structured action ---
+        action = self.command_parser.parse(command_text)
+        action_path = self.action_writer.write(action)
+        self._print(f"  🎯 Action: {action.action_type} (confidence={action.confidence:.0%})")
+
+        if action.action_type == "send_message":
+            channel = action.channel or "unknown"
+            self._print(f"  📨 [{channel}] To: {action.recipient} | Body: {action.message_body[:80]}")
+
+            # Try direct iMessage execution
+            if action.channel == "imessage" and self.action_executor.can_execute_locally(action):
+                success, detail = self.action_executor.execute(action)
+                if success:
+                    self._print(f"  ✅ {detail}")
+                    self._alert("Message Sent", f"iMessage to {action.recipient}")
+                    action.status = "executed"
+                else:
+                    self._print(f"  ⚠️  iMessage failed: {detail} — queued for OpenCLAW")
+                    action.status = "pending"
+                # Re-write with updated status
+                action_path.write_text(json.dumps(asdict(action), indent=2))
+            else:
+                self._print(f"  📬 Queued for OpenCLAW ({channel})")
+
+        elif action.action_type == "set_reminder":
+            self._print(f"  ⏰ Reminder: {action.reminder_text[:80]}")
+            if action.reminder_time:
+                self._print(f"  🕐 Time: {action.reminder_time}")
+            self._alert("Reminder Set", action.reminder_text[:100])
+
+        elif action.action_type == "search":
+            self._print(f"  🔍 Search: {action.search_query[:80]}")
+
+        elif action.action_type == "note":
+            self._print(f"  📝 Note: {action.note_text[:80]}")
+
+        self._print(f"  📥 Action written to: {action_path}")
+
+        # --- CLASSIFY & ROUTE command ---
+        self._classify_and_route(command_text, "command", {
+            "type": "voice_command", "command": command_text,
+            "action": asdict(action),
+            "timestamp": ts_iso(), "context": context[-10:],
+        })
 
     # --- Conversations ---
 
@@ -490,6 +587,14 @@ class EventHandler:
             full_summary = summary or title or "(no summary)"
             path = self.inbox.write_conversation_end(conv_id, full_summary, utterances)
             self._print(f"  📥 Conversation written to: {path} ({len(utterances)} utterances)")
+
+            # --- CLASSIFY & ROUTE conversation ---
+            all_text = full_summary + " " + " ".join(u.get("text", "") for u in utterances)
+            self._classify_and_route(all_text, "conversation", {
+                "type": "conversation_ended", "conversation_id": conv_id,
+                "summary": full_summary, "utterance_count": len(utterances),
+                "utterances": utterances, "timestamp": ts_iso(),
+            })
         else:
             if conv_id in self.active_conversations:
                 self.active_conversations[conv_id]["state"] = state
@@ -545,9 +650,15 @@ class EventHandler:
 
         if state == "READY" and text:
             self._alert("Note Ready", text[:150])
-            # Write to inbox immediately
+            # Write to original inbox
             path = self.inbox.write_journal(journal_id, text, state)
             self._print(f"  📥 Journal written to: {path}")
+
+            # --- CLASSIFY & ROUTE ---
+            self._classify_and_route(text, "journal", {
+                "type": "journal_note", "journal_id": journal_id,
+                "text": text, "state": state, "timestamp": ts_iso(),
+            })
 
             # --- KEYWORD DETECTION in finalized journal ---
             if self.command_capture is not None:
