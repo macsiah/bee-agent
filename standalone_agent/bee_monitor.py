@@ -524,10 +524,12 @@ class EventHandler:
         path = self.inbox.write_command(command_text, context)
         self._print(f"  📥 Written to: {path}")
 
-        # --- PARSE into structured action ---
-        action = self.command_parser.parse(command_text)
+        # --- PARSE into structured action via LLM ---
+        action = self.command_parser.parse(command_text, context=context)
         action_path = self.action_writer.write(action)
         self._print(f"  🎯 Action: {action.action_type} (confidence={action.confidence:.0%})")
+        if action.intent_summary:
+            self._print(f"  💡 Intent: {action.intent_summary[:120]}")
 
         if action.action_type == "send_message":
             channel = action.channel or "unknown"
@@ -554,11 +556,28 @@ class EventHandler:
                 self._print(f"  🕐 Time: {action.reminder_time}")
             self._alert("Reminder Set", action.reminder_text[:100])
 
-        elif action.action_type == "search":
-            self._print(f"  🔍 Search: {action.search_query[:80]}")
+        elif action.action_type in ("search", "query"):
+            query = action.search_query or action.intent_summary
+            self._print(f"  🔍 Query: {query[:80]}")
 
         elif action.action_type == "note":
             self._print(f"  📝 Note: {action.note_text[:80]}")
+
+        elif action.action_type == "summarize":
+            self._print(f"  📊 Summarize: {action.intent_summary[:80]}")
+
+        elif action.action_type == "control":
+            self._print(f"  ⚙️  Control: {action.intent_summary[:80]}")
+
+        elif action.action_type == "schedule":
+            self._print(f"  📅 Schedule: {action.intent_summary[:80]}")
+
+        elif action.action_type == "play_media":
+            self._print(f"  🎵 Media: {action.intent_summary[:80]}")
+
+        else:
+            # Any other action type the LLM inferred
+            self._print(f"  🔧 Command: {action.intent_summary or action.openclaw_command[:80]}")
 
         self._print(f"  📥 Action written to: {action_path}")
 
