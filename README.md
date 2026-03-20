@@ -673,6 +673,7 @@ tail -f /tmp/bee-monitor.err
 
 - [bee-cli](https://github.com/bee-computer/bee-cli) — Official Bee CLI (TypeScript)
 - [bee-skill](https://github.com/bee-computer/bee-skill) — Official Bee agent skill
+- [77degrees/bee-skill](https://github.com/77degrees/bee-skill) — Extended fork with UI docs (our SKILL.md incorporates content from here, MIT licensed)
 - [beemcp](https://github.com/OkGoDoIt/beemcp) — Community MCP server (uses older API)
 - [imsg](https://github.com/nicklama/imsg) — Terminal iMessage/SMS client
 

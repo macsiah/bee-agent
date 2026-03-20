@@ -77,6 +77,9 @@ COLLATION_INTERVAL_SEC = 300  # 5 minutes
 
 # Default trigger keywords (case-insensitive, fuzzy matched)
 DEFAULT_TRIGGERS = ["openclaw", "open claw", "hey openclaw", "hey open claw"]
+NOTE_TO_SELF_PATTERNS = [
+    re.compile(r"^(?:hey\s+)?note\s+to\s+self\b", re.IGNORECASE),
+]
 
 
 def find_bee_cli() -> str:
@@ -190,12 +193,14 @@ class TriggerDetector:
     """Detects the activation keyword in utterance text."""
 
     def __init__(self, triggers: list[str]):
-        # Build regex patterns for each trigger (case-insensitive, word boundary)
+        # Build regex patterns that prefer command-style invocations at the
+        # start of an utterance or after punctuation, not casual mentions
+        # in the middle of a sentence.
         self.patterns = []
         for trigger in triggers:
-            # Allow fuzzy spacing and common mishearings
+            trigger_pattern = re.escape(trigger).replace(r'\ ', r'\s+')
             pattern = re.compile(
-                r'\b' + re.escape(trigger).replace(r'\ ', r'\s+') + r'\b',
+                r'(?:^|[.!?]\s+|[,;:]\s*)' + trigger_pattern + r'\b',
                 re.IGNORECASE,
             )
             self.patterns.append(pattern)
@@ -359,6 +364,7 @@ class EventHandler:
         self.recent_todos: list[dict] = []
         self.command_capture: Optional[CommandCapture] = None
         self.last_collation_time: float = time.time()
+        self.finalized_conversations: set[str] = set()
 
         self.stats = {
             "utterances": 0,
@@ -369,6 +375,33 @@ class EventHandler:
             "thought_digests": 0,
             "items_classified": 0,
         }
+
+    def _is_note_to_self(self, text: str) -> bool:
+        return any(pattern.search(text.strip()) for pattern in NOTE_TO_SELF_PATTERNS)
+
+    def _write_local_note_to_self(self, text: str, source_type: str, source_id: str) -> Optional[Path]:
+        action = ActionRequest(
+            action_type="note",
+            raw_command=text,
+            timestamp=ts_iso(),
+            confidence=1.0,
+            intent_summary=f"Save {source_type} note to Apple Notes",
+            note_text=text,
+            note_category="note-to-self",
+        )
+        action_path = self.action_writer.write(action)
+        success, detail = self.action_executor.execute(action)
+        action.status = "executed" if success else "failed"
+        action.parse_notes = f"{source_type}:{source_id}"
+        action_path.write_text(json.dumps(asdict(action), indent=2))
+
+        if success:
+            self._print(f'  📝 Note to Self saved: {detail}')
+            self._alert("Note to Self Saved", text[:100])
+        else:
+            self._print(f"  ⚠️  Note to Self failed: {detail}")
+
+        return action_path
 
     def _classify_and_route(self, text: str, source_type: str, raw_content: dict):
         """Classify content and route to categorized folders + knowledge base + memory."""
@@ -535,15 +568,16 @@ class EventHandler:
             channel = action.channel or "unknown"
             self._print(f"  📨 [{channel}] To: {action.recipient} | Body: {action.message_body[:80]}")
 
-            # Try direct iMessage execution
-            if action.channel == "imessage" and self.action_executor.can_execute_locally(action):
+            # Try direct channel execution for transports the monitor can handle.
+            if self.action_executor.can_execute_locally(action):
                 success, detail = self.action_executor.execute(action)
                 if success:
                     self._print(f"  ✅ {detail}")
-                    self._alert("Message Sent", f"iMessage to {action.recipient}")
+                    target = action.recipient or "self"
+                    self._alert("Message Sent", f"{channel} to {target}")
                     action.status = "executed"
                 else:
-                    self._print(f"  ⚠️  iMessage failed: {detail} — queued for OpenCLAW")
+                    self._print(f"  ⚠️  {channel} send failed: {detail} — queued for OpenCLAW")
                     action.status = "pending"
                 # Re-write with updated status
                 action_path.write_text(json.dumps(asdict(action), indent=2))
@@ -554,7 +588,17 @@ class EventHandler:
             self._print(f"  ⏰ Reminder: {action.reminder_text[:80]}")
             if action.reminder_time:
                 self._print(f"  🕐 Time: {action.reminder_time}")
-            self._alert("Reminder Set", action.reminder_text[:100])
+            if self.action_executor.can_execute_locally(action):
+                success, detail = self.action_executor.execute(action)
+                action.status = "executed" if success else "failed"
+                action_path.write_text(json.dumps(asdict(action), indent=2))
+                if success:
+                    self._print(f"  ✅ {detail}")
+                    self._alert("Reminder Saved", action.reminder_text[:100])
+                else:
+                    self._print(f"  ⚠️  Reminder save failed: {detail}")
+            else:
+                self._alert("Reminder Set", action.reminder_text[:100])
 
         elif action.action_type in ("search", "query"):
             query = action.search_query or action.intent_summary
@@ -562,6 +606,15 @@ class EventHandler:
 
         elif action.action_type == "note":
             self._print(f"  📝 Note: {action.note_text[:80]}")
+            if self.action_executor.can_execute_locally(action):
+                success, detail = self.action_executor.execute(action)
+                action.status = "executed" if success else "failed"
+                action_path.write_text(json.dumps(asdict(action), indent=2))
+                if success:
+                    self._print(f"  ✅ {detail}")
+                    self._alert("Note Saved", (action.note_text or command_text)[:100])
+                else:
+                    self._print(f"  ⚠️  Note save failed: {detail}")
 
         elif action.action_type == "summarize":
             self._print(f"  📊 Summarize: {action.intent_summary[:80]}")
@@ -619,16 +672,29 @@ class EventHandler:
         state = conv.get("state", "unknown")
         title = conv.get("title", "")
         summary = conv.get("short_summary", "")
+        end_time = conv.get("end_time")
+        has_ended = state in ("completed", "ended", "finalized") or bool(end_time)
 
-        if state in ("completed", "ended", "finalized"):
+        if has_ended:
+            if conv_id in self.finalized_conversations:
+                return
+
             self.stats["conversations_ended"] += 1
+            self.finalized_conversations.add(conv_id)
             conv_data = self.active_conversations.pop(conv_id, {})
             utterances = self.conversation_utterances.pop(conv_uuid, [])
 
             self._alert("Conversation Ended", f"{title or summary or f'ID {conv_id}'}")
 
             # Write full conversation to inbox for processing
-            full_summary = summary or title or "(no summary)"
+            full_summary = (
+                conv.get("summary")
+                or summary
+                or title
+                or conv_data.get("short_summary", "")
+                or conv_data.get("title", "")
+                or "(no summary)"
+            )
             path = self.inbox.write_conversation_end(conv_id, full_summary, utterances)
             self._print(f"  📥 Conversation written to: {path} ({len(utterances)} utterances)")
 
@@ -638,6 +704,7 @@ class EventHandler:
                 "type": "conversation_ended", "conversation_id": conv_id,
                 "summary": full_summary, "utterance_count": len(utterances),
                 "utterances": utterances, "timestamp": ts_iso(),
+                "state": state, "end_time": end_time,
             })
         else:
             if conv_id in self.active_conversations:
@@ -697,6 +764,9 @@ class EventHandler:
             # Write to original inbox
             path = self.inbox.write_journal(journal_id, text, state)
             self._print(f"  📥 Journal written to: {path}")
+
+            if self._is_note_to_self(text):
+                self._write_local_note_to_self(text, "journal", journal_id)
 
             # --- CLASSIFY & ROUTE ---
             self._classify_and_route(text, "journal", {

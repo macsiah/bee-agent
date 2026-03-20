@@ -36,6 +36,7 @@ if the API is unavailable.
 import json
 import os
 import re
+import shutil
 import subprocess
 import traceback
 from dataclasses import dataclass, field, asdict
@@ -64,6 +65,7 @@ except ImportError:
 # Gemini Flash endpoint -- uses the v1beta generateContent API
 GEMINI_MODEL = os.environ.get("BEE_INTENT_MODEL", "gemini-2.5-flash")
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 
 # Where to find the API key (in order of priority):
 #   1. BEE_GEMINI_API_KEY env var
@@ -74,6 +76,31 @@ def _get_api_key() -> str:
         key = os.environ.get(var, "").strip()
         if key:
             return key
+    return _load_openclaw_api_key()
+
+
+def _load_openclaw_api_key() -> str:
+    """Fall back to the local OpenCLAW config when launchd has no Gemini env vars.
+
+    This keeps the Bee monitor working when it runs as a background service
+    without inheriting the interactive shell environment.
+    """
+    try:
+        if not OPENCLAW_CONFIG_PATH.exists():
+            return ""
+        data = json.loads(OPENCLAW_CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    # Reuse the existing Google-backed skill key already present in this install.
+    key = (
+        data.get("skills", {})
+        .get("entries", {})
+        .get("nano-banana-pro", {})
+        .get("apiKey", "")
+    )
+    if isinstance(key, str):
+        return key.strip()
     return ""
 
 
@@ -494,6 +521,8 @@ class ActionWriter:
 # ---------------------------------------------------------------------------
 
 IMSG_CLI = "/opt/homebrew/bin/imsg"
+OPENCLAW_CLI = "/Users/macsiah/.nvm/versions/node/v25.6.0/bin/openclaw"
+SELF_RECIPIENT_ALIASES = {"", "me", "myself", "my", "my phone", "self"}
 
 def _find_imsg() -> str:
     """Locate the imsg CLI binary."""
@@ -591,6 +620,297 @@ class IMessageSender:
 
 
 # ---------------------------------------------------------------------------
+# Apple Notes writer
+# ---------------------------------------------------------------------------
+
+NOTE_TO_SELF_FOLDER = os.environ.get("BEE_NOTE_TO_SELF_FOLDER", "Note to Self")
+REMINDERS_LIST = os.environ.get("BEE_REMINDERS_LIST", "Bee")
+
+
+def _strip_note_prefix(text: str) -> str:
+    cleaned = text.strip()
+    patterns = [
+        r"^(?:hey\s+)?note\s+to\s+self[:,\s-]*",
+        r"^(?:please\s+)?save\s+(?:this\s+)?note[:,\s-]*",
+        r"^(?:please\s+)?add\s+(?:this\s+)?note[:,\s-]*",
+        r"^(?:please\s+)?jot\s+(?:this\s+)?down[:,\s-]*",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip() or text.strip()
+
+
+class AppleNotesWriter:
+    """Creates notes in Apple Notes via AppleScript."""
+
+    def __init__(self, folder_name: str = NOTE_TO_SELF_FOLDER):
+        self.folder_name = folder_name
+
+    def create_note(self, text: str, title: str = "") -> tuple[bool, str]:
+        if not text.strip():
+            return False, "No note text specified"
+
+        note_text = _strip_note_prefix(text)
+        note_title = title.strip() or f"Bee Note to Self — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        note_body = note_text.replace("\n", "<br>")
+
+        script = """
+        set folderName to system attribute "BEE_NOTES_FOLDER"
+        set noteTitle to system attribute "BEE_NOTES_TITLE"
+        set noteBody to system attribute "BEE_NOTES_BODY"
+        tell application "Notes"
+            if not (exists folder folderName) then
+                make new folder with properties {name:folderName}
+            end if
+            tell folder folderName
+                make new note with properties {name:noteTitle, body:noteBody}
+            end tell
+        end tell
+        """
+
+        env = {
+            **os.environ,
+            "BEE_NOTES_FOLDER": self.folder_name,
+            "BEE_NOTES_TITLE": note_title,
+            "BEE_NOTES_BODY": note_body,
+        }
+
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+            )
+            if result.returncode == 0:
+                return True, f'Apple Note created in "{self.folder_name}"'
+            err = result.stderr.strip() or result.stdout.strip()
+            return False, f"Notes error: {err}"
+        except subprocess.TimeoutExpired:
+            return False, "Apple Notes write timed out"
+        except Exception as e:
+            return False, f"Apple Notes error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Apple Reminders writer
+# ---------------------------------------------------------------------------
+
+class ReminderWriter:
+    """Creates reminders in Apple Reminders via remindctl."""
+
+    def __init__(self, list_name: str = REMINDERS_LIST):
+        self.list_name = list_name
+        self.binary = "remindctl"
+
+    def create_reminder(
+        self,
+        title: str,
+        due: str = "",
+        notes: str = "",
+        priority: str = "",
+    ) -> tuple[bool, str]:
+        if not title.strip():
+            return False, "No reminder text specified"
+
+        cmd = [
+            self.binary,
+            "add",
+            title.strip(),
+            "--list",
+            self.list_name,
+            "--no-input",
+            "--plain",
+        ]
+
+        if due.strip():
+            cmd.extend(["--due", due.strip()])
+        if notes.strip():
+            cmd.extend(["--notes", notes.strip()])
+        if priority.strip() in {"none", "low", "medium", "high"}:
+            cmd.extend(["--priority", priority.strip()])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                return True, f'Reminder created in "{self.list_name}"'
+            err = result.stderr.strip() or result.stdout.strip()
+            return False, f"Reminders error: {err}"
+        except subprocess.TimeoutExpired:
+            return False, "Reminder creation timed out"
+        except Exception as e:
+            return False, f"Reminders error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# OpenCLAW channel messenger
+# ---------------------------------------------------------------------------
+
+def _find_openclaw() -> str:
+    """Locate the OpenCLAW CLI binary."""
+    candidates = [
+        OPENCLAW_CLI,
+        shutil.which("openclaw") or "",
+        "/usr/local/bin/openclaw",
+        "/opt/homebrew/bin/openclaw",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            result = subprocess.run(
+                [candidate, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return candidate
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return ""
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the last JSON object from CLI output that may include banner lines."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+class OpenClawMessenger:
+    """Send messages through OpenCLAW's native channel transports."""
+
+    def __init__(self):
+        self.binary = _find_openclaw()
+        self._self_targets: dict[str, str] = {}
+
+    def is_available(self) -> bool:
+        return bool(self.binary)
+
+    def default_target(self, channel: str) -> str:
+        key = channel.strip().lower()
+        if key in self._self_targets:
+            return self._self_targets[key]
+
+        target = ""
+        if key == "telegram":
+            target = (
+                os.environ.get("BEE_TELEGRAM_SELF_TARGET", "").strip()
+                or self._infer_telegram_self_target()
+            )
+        elif key == "whatsapp":
+            target = (
+                os.environ.get("BEE_WHATSAPP_SELF_TARGET", "").strip()
+                or self._infer_whatsapp_self_target()
+            )
+
+        self._self_targets[key] = target
+        return target
+
+    def send(self, channel: str, recipient: str, message: str) -> tuple[bool, str]:
+        if not self.binary:
+            return False, "OpenCLAW CLI not found"
+        if not message.strip():
+            return False, "No message body specified"
+
+        normalized_channel = channel.strip().lower()
+        normalized_recipient = recipient.strip()
+        if normalized_recipient.lower() in SELF_RECIPIENT_ALIASES:
+            normalized_recipient = ""
+
+        target = normalized_recipient or self.default_target(normalized_channel)
+        if not target:
+            return False, f"No recipient specified for {normalized_channel}"
+
+        cmd = [
+            self.binary,
+            "message",
+            "send",
+            "--channel",
+            normalized_channel,
+            "--target",
+            target,
+            "--message",
+            message,
+            "--json",
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"{normalized_channel} send timed out"
+        except Exception as e:
+            return False, f"{normalized_channel} send error: {e}"
+
+        combined = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        if result.returncode != 0:
+            detail = combined.strip() or f"openclaw message send exited {result.returncode}"
+            return False, detail
+
+        payload = _extract_json_object(combined)
+        resolved_target = target
+        if payload:
+            resolved_target = (
+                payload.get("payload", {}).get("to")
+                or payload.get("target")
+                or target
+            )
+        return True, f"{normalized_channel} message sent to {resolved_target}"
+
+    def _infer_whatsapp_self_target(self) -> str:
+        payload = self._run_json(
+            [self.binary, "directory", "self", "--channel", "whatsapp", "--json"]
+        )
+        if not payload:
+            return ""
+        target = payload.get("id", "")
+        return target.strip() if isinstance(target, str) else ""
+
+    def _infer_telegram_self_target(self) -> str:
+        payload = self._run_json([self.binary, "sessions", "--all-agents", "--json"])
+        if not payload:
+            return ""
+        sessions = payload.get("sessions", [])
+        for session in sessions:
+            key = session.get("key", "")
+            match = re.search(r":telegram:(?:direct|slash):([^:]+)$", key)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _run_json(self, cmd: list[str]) -> dict | None:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        return _extract_json_object(result.stdout or "")
+
+
+# ---------------------------------------------------------------------------
 # Action Executor (for actions that can be run directly by the monitor)
 # ---------------------------------------------------------------------------
 
@@ -600,12 +920,21 @@ class ActionExecutor:
 
     def __init__(self):
         self.imessage = IMessageSender()
+        self.openclaw = OpenClawMessenger()
+        self.notes = AppleNotesWriter()
+        self.reminders = ReminderWriter()
         self.contacts = ContactResolver()
 
     def can_execute_locally(self, action: ActionRequest) -> bool:
         """Check if this action can be executed directly by the monitor."""
         if action.action_type == "send_message" and action.channel == "imessage":
             return self.imessage.is_available()
+        if action.action_type == "send_message" and action.channel in {"telegram", "whatsapp"}:
+            return self.openclaw.is_available()
+        if action.action_type == "note":
+            return True
+        if action.action_type == "set_reminder":
+            return True
         return False
 
     def execute(self, action: ActionRequest) -> tuple[bool, str]:
@@ -622,4 +951,28 @@ class ActionExecutor:
             if success:
                 return True, f"iMessage sent to {detail_recipient}"
             return False, detail
+        if action.action_type == "send_message" and action.channel in {"telegram", "whatsapp"}:
+            recipient = action.recipient
+            if recipient.lower().strip() in SELF_RECIPIENT_ALIASES:
+                recipient = ""
+            return self.openclaw.send(action.channel, recipient, action.message_body)
+        if action.action_type == "note":
+            note_text = action.note_text or action.raw_command
+            title = action.intent_summary if action.intent_summary else ""
+            return self.notes.create_note(note_text, title=title)
+        if action.action_type == "set_reminder":
+            reminder_text = action.reminder_text or action.raw_command
+            reminder_notes = action.raw_command
+            priority = ""
+            summary = (action.intent_summary or "").lower()
+            if "urgent" in summary:
+                priority = "high"
+            elif "important" in summary:
+                priority = "medium"
+            return self.reminders.create_reminder(
+                reminder_text,
+                due=action.reminder_time,
+                notes=reminder_notes,
+                priority=priority,
+            )
         return False, f"Cannot execute {action.action_type}/{action.channel} locally"
